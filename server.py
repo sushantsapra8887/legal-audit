@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-GoLegal - Smart Legal Compliance Audit Crawler v2
-Crawler + AI working together for accurate results
+GoLegal - Smart Legal Compliance Audit Crawler v3
+Powered by Google Gemini AI + Deep Crawler
 """
 
 from flask import Flask, request, jsonify, send_from_directory
@@ -13,29 +13,28 @@ import re
 import time
 import os
 import json
-import anthropic
 
 app = Flask(__name__)
 CORS(app)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
 }
 TIMEOUT = 15
-MAX_PAGES = 20  # max pages to crawl per site
+MAX_PAGES = 20
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
-# ─── FETCHING ────────────────────────────────────────────────────────────────
+# ─── FETCH ────────────────────────────────────────────────────────────────────
 
 def fetch_page(url):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "noscript", "svg", "img"]):
+        for tag in soup(["script", "style", "noscript", "svg"]):
             tag.decompose()
         text = soup.get_text(separator=" ", strip=True)
         return soup, text, resp.status_code, None
@@ -43,15 +42,13 @@ def fetch_page(url):
         return None, "", 0, str(e)
 
 def fetch_sitemap(base_url):
-    """Try to find and parse sitemap for all URLs"""
     urls = []
-    for path in ["/sitemap.xml", "/sitemap_index.xml", "/sitemap.php", "/sitemap/"]:
+    for path in ["/sitemap.xml", "/sitemap_index.xml", "/sitemap.php"]:
         try:
             resp = requests.get(base_url.rstrip("/") + path, headers=HEADERS, timeout=8)
             if resp.status_code == 200 and "xml" in resp.headers.get("content-type", ""):
                 soup = BeautifulSoup(resp.text, "xml")
-                locs = soup.find_all("loc")
-                urls.extend([l.get_text(strip=True) for l in locs[:50]])
+                urls.extend([l.get_text(strip=True) for l in soup.find_all("loc")[:50]])
                 if urls:
                     break
         except:
@@ -59,7 +56,6 @@ def fetch_sitemap(base_url):
     return urls
 
 def fetch_robots(base_url):
-    """Fetch robots.txt for any useful info"""
     try:
         resp = requests.get(base_url.rstrip("/") + "/robots.txt", headers=HEADERS, timeout=8)
         if resp.status_code == 200:
@@ -68,216 +64,146 @@ def fetch_robots(base_url):
         pass
     return ""
 
-# ─── LINK DISCOVERY ───────────────────────────────────────────────────────────
+# ─── DISCOVERY ────────────────────────────────────────────────────────────────
 
-def get_all_internal_links(soup, base_url):
-    """Get all internal links from a page"""
-    links = set()
-    if not soup:
-        return links
-    base_domain = urlparse(base_url).netloc
-    for a in soup.find_all("a", href=True):
-        try:
-            full = urljoin(base_url, a["href"])
-            parsed = urlparse(full)
-            if parsed.netloc == base_domain and parsed.scheme in ("http", "https"):
-                # Clean URL - remove fragments
-                clean = parsed._replace(fragment="").geturl()
-                links.add(clean)
-        except:
-            pass
-    return links
+POLICY_KEYWORDS = {
+    "privacy": 90, "privacy-policy": 95, "privacypolicy": 95,
+    "terms": 70, "terms-of-service": 95, "terms-and-conditions": 95,
+    "tos": 80, "terms-of-use": 90, "termsofuse": 90,
+    "cookie": 85, "cookies": 80, "cookie-policy": 95,
+    "refund": 90, "cancellation": 85, "return-policy": 90,
+    "disclaimer": 85, "legal": 70, "legal-notice": 90,
+    "contact": 50, "grievance": 90, "gdpr": 90, "dpdp": 95,
+    "data-protection": 85, "shipping": 70, "about": 20,
+    "data-policy": 90, "user-agreement": 90,
+}
 
-def score_url_for_policy(url, text):
-    """Score how likely a URL/link text is to be a policy page (0-100)"""
-    url_lower = url.lower()
-    text_lower = text.lower()
-    combined = url_lower + " " + text_lower
+def score_url(url, anchor=""):
+    combined = url.lower() + " " + anchor.lower()
     score = 0
-
-    policy_keywords = {
-        "privacy": 90, "privacy-policy": 95, "privacypolicy": 95,
-        "terms": 70, "terms-of-service": 95, "terms-and-conditions": 95,
-        "tos": 80, "terms-of-use": 90,
-        "cookie": 85, "cookies": 80,
-        "refund": 90, "cancellation": 85, "return-policy": 90,
-        "disclaimer": 85, "legal": 70, "legal-notice": 90,
-        "about": 20, "contact": 50, "grievance": 90,
-        "gdpr": 90, "dpdp": 90, "data-protection": 85,
-        "shipping": 70, "delivery": 60,
-    }
-    for kw, sc in policy_keywords.items():
+    for kw, sc in POLICY_KEYWORDS.items():
         if kw in combined:
             score = max(score, sc)
     return score
 
-def discover_all_pages(base_url):
-    """
-    Smart multi-source page discovery:
-    1. Homepage links (nav + footer + body)
-    2. Sitemap.xml
-    3. robots.txt hints
-    4. Second-level crawl of important pages
-    """
-    discovered = {}  # url -> {"text": anchor_text, "score": policy_score, "source": where_found}
+def discover_pages(base_url):
+    discovered = {}
     base_domain = urlparse(base_url).netloc
 
-    # 1. Fetch homepage
+    def add_link(url, anchor, source):
+        try:
+            parsed = urlparse(url)
+            if parsed.netloc != base_domain or parsed.scheme not in ("http", "https"):
+                return
+            clean = parsed._replace(fragment="").geturl()
+            sc = score_url(clean, anchor)
+            if clean not in discovered or sc > discovered[clean]["score"]:
+                discovered[clean] = {"anchor": anchor, "score": sc, "source": source}
+        except:
+            pass
+
+    # Fetch homepage
     soup, homepage_text, _, err = fetch_page(base_url)
     if err or not soup:
-        return {}, homepage_text, soup
+        return {}, "", None
 
-    # Collect all links from homepage
+    # All homepage links
     for a in soup.find_all("a", href=True):
-        try:
-            full = urljoin(base_url, a["href"])
-            parsed = urlparse(full)
-            if parsed.netloc == base_domain and parsed.scheme in ("http", "https"):
-                clean = parsed._replace(fragment="").geturl()
-                anchor = a.get_text(strip=True)
-                score = score_url_for_policy(clean, anchor)
-                if clean not in discovered or score > discovered[clean]["score"]:
-                    discovered[clean] = {"anchor": anchor, "score": score, "source": "homepage"}
-        except:
-            pass
+        full = urljoin(base_url, a["href"])
+        add_link(full, a.get_text(strip=True), "homepage")
 
-    # 2. Sitemap
-    sitemap_urls = fetch_sitemap(base_url)
-    for u in sitemap_urls:
-        try:
-            parsed = urlparse(u)
-            if parsed.netloc == base_domain:
-                score = score_url_for_policy(u, "")
-                if u not in discovered:
-                    discovered[u] = {"anchor": "", "score": score, "source": "sitemap"}
-        except:
-            pass
+    # Sitemap
+    for u in fetch_sitemap(base_url):
+        add_link(u, "", "sitemap")
 
-    # 3. robots.txt
+    # robots.txt sitemaps
     robots = fetch_robots(base_url)
-    if robots:
-        for line in robots.splitlines():
-            if line.lower().startswith("sitemap:"):
-                sitemap_url = line.split(":", 1)[1].strip()
-                # fetch this extra sitemap
-                try:
-                    resp = requests.get(sitemap_url, headers=HEADERS, timeout=8)
-                    if resp.status_code == 200:
-                        s = BeautifulSoup(resp.text, "xml")
-                        for loc in s.find_all("loc")[:30]:
-                            u = loc.get_text(strip=True)
-                            if urlparse(u).netloc == base_domain:
-                                score = score_url_for_policy(u, "")
-                                if u not in discovered:
-                                    discovered[u] = {"anchor": "", "score": score, "source": "robots_sitemap"}
-                except:
-                    pass
-
-    # 4. Deep crawl high-scoring pages and nav/footer specifically
-    nav_footer_links = set()
-    for section in soup.find_all(["nav", "footer", "header"]):
-        for a in section.find_all("a", href=True):
+    for line in robots.splitlines():
+        if line.lower().startswith("sitemap:"):
+            sm_url = line.split(":", 1)[1].strip()
             try:
-                full = urljoin(base_url, a["href"])
-                if urlparse(full).netloc == base_domain:
-                    nav_footer_links.add(full)
+                r = requests.get(sm_url, headers=HEADERS, timeout=8)
+                if r.status_code == 200:
+                    s = BeautifulSoup(r.text, "xml")
+                    for loc in s.find_all("loc")[:30]:
+                        add_link(loc.get_text(strip=True), "", "robots_sitemap")
             except:
                 pass
 
-    # Visit nav/footer pages to find more policy links
-    visited_secondary = set()
-    for url in list(nav_footer_links)[:10]:
-        if url == base_url or url in visited_secondary:
+    # Deep crawl nav + footer
+    secondary = set()
+    for section in soup.find_all(["nav", "footer", "header"]):
+        for a in section.find_all("a", href=True):
+            full = urljoin(base_url, a["href"])
+            if urlparse(full).netloc == base_domain:
+                secondary.add(full)
+
+    for sec_url in list(secondary)[:10]:
+        if sec_url == base_url:
             continue
-        visited_secondary.add(url)
-        s2, _, _, e2 = fetch_page(url)
+        s2, _, _, e2 = fetch_page(sec_url)
         if s2:
             for a in s2.find_all("a", href=True):
-                try:
-                    full = urljoin(base_url, a["href"])
-                    parsed = urlparse(full)
-                    if parsed.netloc == base_domain:
-                        clean = parsed._replace(fragment="").geturl()
-                        anchor = a.get_text(strip=True)
-                        score = score_url_for_policy(clean, anchor)
-                        if score >= 60 and clean not in discovered:
-                            discovered[clean] = {"anchor": anchor, "score": score, "source": "secondary_crawl"}
-                except:
-                    pass
+                full = urljoin(base_url, a["href"])
+                anchor = a.get_text(strip=True)
+                sc = score_url(full, anchor)
+                if sc >= 50:
+                    add_link(full, anchor, "secondary_crawl")
 
     return discovered, homepage_text, soup
 
-# ─── PAGE CONTENT COLLECTION ─────────────────────────────────────────────────
-
-def collect_page_contents(base_url, discovered_pages):
-    """
-    Visit high-scoring policy pages and collect their content.
-    Returns dict of url -> content
-    """
+def collect_contents(base_url, discovered):
     contents = {}
-    
-    # Sort by policy score, visit top candidates
-    sorted_pages = sorted(discovered_pages.items(), key=lambda x: x[1]["score"], reverse=True)
-    
+    sorted_pages = sorted(discovered.items(), key=lambda x: x[1]["score"], reverse=True)
     visited = 0
     for url, info in sorted_pages:
-        if visited >= MAX_PAGES:
+        if visited >= MAX_PAGES or info["score"] < 20:
             break
-        if info["score"] < 30:  # skip very low-score pages
-            break
-        _, text, status, err = fetch_page(url)
+        _, text, _, err = fetch_page(url)
         if not err and text and len(text) > 100:
             contents[url] = {
-                "text": text[:8000],  # cap per page
+                "text": text[:6000],
                 "score": info["score"],
                 "anchor": info["anchor"],
                 "source": info["source"]
             }
         visited += 1
-
     return contents
 
-# ─── AI ANALYSIS ─────────────────────────────────────────────────────────────
+# ─── GEMINI AI ────────────────────────────────────────────────────────────────
 
-def ai_analyze(base_url, homepage_text, page_contents, ssl_ok):
-    """
-    Send all crawled evidence to Claude AI for accurate analysis.
-    AI sees everything before making any judgement.
-    """
-    client = anthropic.Anthropic()
+def gemini_analyze(base_url, homepage_text, page_contents, ssl_ok):
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY not set in environment variables")
 
-    # Build evidence summary
-    evidence_parts = []
-    evidence_parts.append(f"WEBSITE: {base_url}")
-    evidence_parts.append(f"SSL/HTTPS: {'Yes' if ssl_ok else 'No'}")
-    evidence_parts.append(f"\n--- HOMEPAGE CONTENT (first 3000 chars) ---\n{homepage_text[:3000]}")
+    # Build evidence
+    evidence = [f"WEBSITE: {base_url}", f"SSL/HTTPS: {'Yes' if ssl_ok else 'No'}"]
+    evidence.append(f"\n--- HOMEPAGE (first 3000 chars) ---\n{homepage_text[:3000]}")
 
-    for url, data in page_contents.items():
-        evidence_parts.append(f"\n--- PAGE: {url} (score: {data['score']}, anchor: '{data['anchor']}') ---\n{data['text'][:3000]}")
+    for url, data in list(page_contents.items())[:15]:
+        evidence.append(f"\n--- PAGE: {url}\nAnchor text: '{data['anchor']}'\n{data['text'][:2500]}")
 
-    evidence = "\n".join(evidence_parts)
+    full_evidence = "\n".join(evidence)[:14000]
 
     prompt = f"""You are an expert Indian legal compliance auditor with deep knowledge of:
 - India's Digital Personal Data Protection (DPDP) Act 2023
-- India's IT Act 2000 and IT (Amendment) Act 2008  
+- India's IT Act 2000 and IT (Amendment) Act 2008
 - Consumer Protection Act 2019
-- RBI guidelines for payment/fintech sites
-- General GDPR principles
-- Standard web legal compliance
+- Standard global web legal compliance
 
-I have crawled a website and collected content from ALL its pages. Your job is to analyze this evidence carefully and provide an ACCURATE compliance audit. 
+I have deep-crawled a website and collected content from {len(page_contents)} pages. Analyze ALL evidence carefully before making any judgement.
 
 CRITICAL RULES:
-- Only mark something as MISSING if you genuinely cannot find it anywhere in the evidence
-- If content exists but is thin/incomplete, mark as WARNING not FAIL
-- Be like a real auditor - thorough and fair, not trigger-happy
-- Consider that policy content might be embedded in pages with unusual names
-- Check ALL provided page contents before making any judgement
+- Only mark something FAIL if genuinely absent from ALL crawled pages
+- If content exists but is thin or incomplete, mark WARN not FAIL
+- Be accurate like a real legal auditor — not too strict, not too lenient
+- A page about "legal" or "policies" might contain multiple policies
+- Check every page before concluding something is missing
 
-HERE IS ALL THE CRAWLED EVIDENCE:
-{evidence[:12000]}
+CRAWLED EVIDENCE:
+{full_evidence}
 
-Analyze and respond with ONLY a valid JSON object (no markdown, no explanation) in this exact format:
+Respond ONLY with a valid JSON object, no markdown or explanation:
 {{
   "checks": {{
     "ssl": {{
@@ -289,8 +215,8 @@ Analyze and respond with ONLY a valid JSON object (no markdown, no explanation) 
     "privacy_policy": {{
       "status": "pass|fail|warn",
       "title": "Privacy Policy",
-      "description": "specific finding - mention what's present or missing",
-      "found_at": "url where found or null"
+      "description": "specific finding",
+      "found_at": "url or null"
     }},
     "terms_of_service": {{
       "status": "pass|fail|warn",
@@ -313,13 +239,13 @@ Analyze and respond with ONLY a valid JSON object (no markdown, no explanation) 
     "dpdp_compliance": {{
       "status": "pass|fail|warn",
       "title": "DPDP Act 2023 Compliance",
-      "description": "specific finding about India's Digital Personal Data Protection Act",
+      "description": "specific finding",
       "found_at": "url or null"
     }},
     "grievance_officer": {{
       "status": "pass|fail|warn",
       "title": "Grievance Officer (IT Act)",
-      "description": "specific finding - required under India's IT Act",
+      "description": "specific finding",
       "found_at": "url or null"
     }},
     "contact_info": {{
@@ -343,49 +269,49 @@ Analyze and respond with ONLY a valid JSON object (no markdown, no explanation) 
     "data_collection": {{
       "status": "pass|fail|warn",
       "title": "Data Collection Transparency",
-      "description": "does the site disclose what data it collects and why",
+      "description": "specific finding",
       "found_at": "url or null"
     }},
     "third_party": {{
       "status": "pass|fail|warn",
       "title": "Third-Party Disclosures",
-      "description": "are third-party tools, payment processors, analytics disclosed",
+      "description": "specific finding",
       "found_at": "url or null"
     }}
   }},
-  "pages_checked": {len(page_contents)},
-  "ai_summary": "2-3 sentence overall assessment of the site's legal compliance posture",
+  "ai_summary": "2-3 sentence overall compliance assessment",
   "top_risks": ["risk1", "risk2", "risk3"]
 }}"""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}]
+    resp = requests.post(
+        f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2000}
+        },
+        timeout=30
     )
-
-    raw = response.content[0].text
-    # Clean any markdown
+    resp.raise_for_status()
+    data = resp.json()
+    raw = data["candidates"][0]["content"]["parts"][0]["text"]
     clean = re.sub(r"```json|```", "", raw).strip()
     return json.loads(clean)
 
 # ─── MAIN AUDIT ──────────────────────────────────────────────────────────────
 
 def full_audit(url):
-    result = {"url": url, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
-
     ssl_ok = url.startswith("https://")
 
     # Phase 1: Discover all pages
-    discovered, homepage_text, soup = discover_all_pages(url)
+    discovered, homepage_text, soup = discover_pages(url)
 
-    # Phase 2: Collect content from policy-likely pages
-    page_contents = collect_page_contents(url, discovered)
+    # Phase 2: Collect page contents
+    page_contents = collect_contents(url, discovered)
 
-    # Phase 3: AI analyzes everything together
-    ai_result = ai_analyze(url, homepage_text, page_contents, ssl_ok)
+    # Phase 3: Gemini AI analysis
+    ai_result = gemini_analyze(url, homepage_text, page_contents, ssl_ok)
 
-    # Build final result
     checks = ai_result.get("checks", {})
     vals = list(checks.values())
     passed = sum(1 for c in vals if c.get("status") == "pass")
@@ -394,18 +320,18 @@ def full_audit(url):
     total = len(vals)
     score = round((passed * 10 + warned * 5) / max(total * 10, 1) * 100)
 
-    result["checks"] = checks
-    result["score"] = score
-    result["summary"] = {"passed": passed, "warnings": warned, "failed": failed, "total": total}
-    result["pages_crawled"] = list(page_contents.keys())
-    result["pages_checked"] = ai_result.get("pages_checked", len(page_contents))
-    result["ai_summary"] = ai_result.get("ai_summary", "")
-    result["top_risks"] = ai_result.get("top_risks", [])
-    result["policy_links"] = {
-        url: data["anchor"] for url, data in page_contents.items() if data["score"] >= 60
+    return {
+        "url": url,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "checks": checks,
+        "score": score,
+        "summary": {"passed": passed, "warnings": warned, "failed": failed, "total": total},
+        "pages_crawled": list(page_contents.keys()),
+        "pages_checked": len(page_contents),
+        "ai_summary": ai_result.get("ai_summary", ""),
+        "top_risks": ai_result.get("top_risks", []),
+        "policy_links": {u: d["anchor"] for u, d in page_contents.items() if d["score"] >= 60}
     }
-
-    return result
 
 # ─── ROUTES ──────────────────────────────────────────────────────────────────
 
@@ -424,16 +350,17 @@ def audit():
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     try:
-        result = full_audit(url)
-        return jsonify(result)
+        return jsonify(full_audit(url))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 500
     except json.JSONDecodeError:
-        return jsonify({"error": "AI could not parse the site. Please try again."}), 500
+        return jsonify({"error": "AI response could not be parsed. Please try again."}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "service": "GoLegal Smart Audit Crawler v2"})
+    return jsonify({"status": "ok", "service": "GoLegal Smart Audit v3 - Gemini Powered"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

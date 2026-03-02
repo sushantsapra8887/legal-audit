@@ -4,7 +4,8 @@ from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-import re, time, os, json, traceback
+import re, os, json, traceback
+import concurrent.futures
 
 app = Flask(__name__)
 CORS(app)
@@ -15,11 +16,13 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5
 
 def fetch_page(url):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=12, allow_redirects=True)
+        # Reduced timeout to 4 seconds to prevent Gunicorn worker timeout
+        r = requests.get(url, headers=HEADERS, timeout=4, allow_redirects=True)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         for t in soup(["script","style","noscript"]): t.decompose()
-        return soup, soup.get_text(separator=" ", strip=True)[:5000], None
+        # Only take first 1500 chars — enough to detect policies
+        return soup, soup.get_text(separator=" ", strip=True)[:1500], None
     except Exception as e:
         return None, "", str(e)
 
@@ -31,12 +34,10 @@ def find_links(soup, base_url):
     for a in soup.find_all("a", href=True):
         try:
             full = urljoin(base_url, a["href"])
-            p = urlparse(full)
-            if p.netloc != base_domain: continue
+            if urlparse(full).netloc != base_domain: continue
             anchor = a.get_text(strip=True).lower()
-            href_lower = full.lower()
             for kw in keywords:
-                if kw in href_lower or kw in anchor:
+                if kw in full.lower() or kw in anchor:
                     if kw not in links:
                         links[kw] = full
         except: pass
@@ -48,30 +49,18 @@ def call_gemini(prompt):
         headers={"Content-Type": "application/json"},
         json={
             "contents": [{"parts": [{"text": prompt}]}],
-           "generationConfig": {
-    "temperature": 0.1,
-    "maxOutputTokens": 3000
-}
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 800,
+                "responseMimeType": "application/json" # Forces Gemini to return strict JSON
+            }
         },
-        timeout=60
+        timeout=25
     )
     if resp.status_code != 200:
-        raise Exception(f"Gemini error {resp.status_code}: {resp.text[:300]}")
-    data = resp.json()
-    raw = data["candidates"][0]["content"]["parts"][0]["text"]
-    # Clean any markdown code blocks
-    clean = re.sub(r"```json\s*|\s*```", "", raw).strip()
-    return clean
-
-def build_default_checks():
-    """Return default fail checks if AI fails"""
-    keys = ["ssl","privacy_policy","terms_of_service","cookie_policy","refund_policy",
-            "dpdp_compliance","grievance_officer","contact_info","disclaimer","copyright"]
-    titles = ["SSL Security","Privacy Policy","Terms of Service","Cookie Policy",
-              "Refund Policy","DPDP Act 2023","Grievance Officer","Contact Information",
-              "Legal Disclaimer","Copyright Notice"]
-    return {k: {"status":"fail","title":t,"description":"Could not verify","found_at":None}
-            for k, t in zip(keys, titles)}
+        raise Exception(f"Gemini API Error {resp.status_code}: {resp.text[:200]}")
+    
+    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 @app.route("/")
 def index():
@@ -82,167 +71,107 @@ def audit():
     try:
         data = request.get_json()
         if not data: return jsonify({"error": "No JSON body"}), 400
-        url = data.get("url","").strip()
+        url = data.get("url", "").strip()
         if not url: return jsonify({"error": "URL required"}), 400
-        if not url.startswith(("http://","https://")): url = "https://"+url
-        if not GEMINI_API_KEY:
-            return jsonify({"error": "GEMINI_API_KEY not set"}), 500
+        if not url.startswith(("http://","https://")): url = "https://" + url
+        if not GEMINI_API_KEY: return jsonify({"error": "GEMINI_API_KEY not set"}), 500
 
-        # Step 1: fetch homepage
+        # Step 1: Fetch homepage
         soup, homepage_text, err = fetch_page(url)
-        if err:
-            return jsonify({"error": f"Cannot reach website: {err}"}), 400
+        if err: return jsonify({"error": f"Cannot reach website: {err}"}), 400
 
-        # Step 2: find policy links
+        # Step 2: Find policy links
         links = find_links(soup, url)
 
-        # Step 3: fetch each policy page
-        pages_content = {"homepage": homepage_text}
-        for kw, link_url in list(links.items())[:6]:
+        # Step 3: Fetch policy pages IN PARALLEL (Massive Speed Boost)
+        pages = {"Homepage": homepage_text}
+        links_to_fetch = list(links.items())[:5]
+        
+        def fetch_policy_task(item):
+            kw, link_url = item
             _, text, e = fetch_page(link_url)
             if not e and text:
-                pages_content[link_url] = text[:2000]
+                return kw.title(), text
+            return None, None
 
-        # Step 4: build evidence string
-        evidence = f"WEBSITE: {url}\nSSL: {'Yes' if url.startswith('https') else 'No'}\n"
-        for page_url, text in pages_content.items():
-            evidence += f"\n=== {page_url} ===\n{text[:1500]}\n"
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            results = executor.map(fetch_policy_task, links_to_fetch)
+            for title, text in results:
+                if title and text:
+                    pages[title] = text
 
-        # Step 5: call Gemini with strict JSON instruction
-        prompt = f"""You are an Indian legal compliance auditor. Analyze this website and return a JSON compliance report.
+        # Step 4: Build SHORT evidence summary
+        ssl = "YES" if url.startswith("https") else "NO"
+        evidence_lines = [f"URL: {url} | SSL: {ssl}"]
+        for name, text in pages.items():
+            evidence_lines.append(f"[{name}]: {text[:400]}")
+        evidence = "\n".join(evidence_lines)
 
-WEBSITE EVIDENCE:
-{evidence[:8000]}
+        # Step 5: SHORT focused prompt
+        prompt = f"""Indian legal compliance audit. Check this website evidence and respond with ONLY a JSON object.
 
-INSTRUCTIONS:
-- Only mark FAIL if genuinely absent from ALL pages
-- Mark WARN if present but incomplete  
-- Be accurate and fair like a real auditor
-- Return ONLY the JSON object below, filled in with your findings
+{evidence}
 
-JSON FORMAT TO RETURN:
-{{
-  "score": 75,
-  "checks": {{
-    "ssl": {{"status": "pass", "title": "SSL Security", "description": "your finding here", "found_at": null}},
-    "privacy_policy": {{"status": "pass", "title": "Privacy Policy", "description": "your finding here", "found_at": "url or null"}},
-    "terms_of_service": {{"status": "fail", "title": "Terms of Service", "description": "your finding here", "found_at": null}},
-    "cookie_policy": {{"status": "warn", "title": "Cookie Policy", "description": "your finding here", "found_at": null}},
-    "refund_policy": {{"status": "fail", "title": "Refund Policy", "description": "your finding here", "found_at": null}},
-    "dpdp_compliance": {{"status": "warn", "title": "DPDP Act 2023", "description": "your finding here", "found_at": null}},
-    "grievance_officer": {{"status": "fail", "title": "Grievance Officer", "description": "your finding here", "found_at": null}},
-    "contact_info": {{"status": "pass", "title": "Contact Information", "description": "your finding here", "found_at": null}},
-    "disclaimer": {{"status": "fail", "title": "Legal Disclaimer", "description": "your finding here", "found_at": null}},
-    "copyright": {{"status": "pass", "title": "Copyright Notice", "description": "your finding here", "found_at": null}}
-  }},
-  "ai_summary": "your 2-3 sentence overall assessment here",
-  "top_risks": ["risk 1", "risk 2", "risk 3"]
-}}"""
+JSON response (fill in actual findings, start with {{, end with }}):
+{{"score":0,"checks":{{"ssl":{{"status":"pass","title":"SSL","description":"finding","found_at":null}},"privacy_policy":{{"status":"fail","title":"Privacy Policy","description":"finding","found_at":null}},"terms_of_service":{{"status":"fail","title":"Terms of Service","description":"finding","found_at":null}},"cookie_policy":{{"status":"fail","title":"Cookie Policy","description":"finding","found_at":null}},"refund_policy":{{"status":"fail","title":"Refund Policy","description":"finding","found_at":null}},"dpdp_compliance":{{"status":"fail","title":"DPDP Act 2023","description":"finding","found_at":null}},"grievance_officer":{{"status":"fail","title":"Grievance Officer","description":"finding","found_at":null}},"contact_info":{{"status":"fail","title":"Contact Info","description":"finding","found_at":null}},"disclaimer":{{"status":"fail","title":"Disclaimer","description":"finding","found_at":null}},"copyright":{{"status":"fail","title":"Copyright","description":"finding","found_at":null}}}},"ai_summary":"summary","top_risks":["r1","r2","r3"]}}"""
 
-        # Call Gemini
         raw_json = call_gemini(prompt)
 
-        # Try to parse — with fallback
+        # Parse Native JSON cleanly
         try:
             result = json.loads(raw_json)
         except json.JSONDecodeError:
-            # Try to extract JSON from response
-            match = re.search(r'\{.*\}', raw_json, re.DOTALL)
-            if match:
-                result = json.loads(match.group())
-            else:
-                raise Exception(f"Could not parse AI response: {raw_json[:200]}")
+            return jsonify({"error": "Failed to parse AI response as JSON", "raw": raw_json[:200]}), 500
 
-        checks = result.get("checks", build_default_checks())
+        checks = result.get("checks", {})
         vals = list(checks.values())
         passed = sum(1 for c in vals if c.get("status") == "pass")
         warned = sum(1 for c in vals if c.get("status") == "warn")
         failed = sum(1 for c in vals if c.get("status") == "fail")
         total = len(vals)
-        score = result.get("score", round((passed*10 + warned*5) / max(total*10,1) * 100))
 
         return jsonify({
             "url": url,
-            "score": score,
+            "score": result.get("score", round((passed*10+warned*5)/max(total*10,1)*100)),
             "checks": checks,
             "summary": {"passed": passed, "warnings": warned, "failed": failed, "total": total},
-            "pages_crawled": list(pages_content.keys()),
-            "pages_checked": len(pages_content),
+            "pages_crawled": list(pages.keys()),
+            "pages_checked": len(pages),
             "ai_summary": result.get("ai_summary", ""),
             "top_risks": result.get("top_risks", []),
             "policy_links": links
         })
 
     except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "trace": traceback.format_exc()[-800:]
-        }), 500
+        error_msg = str(e)
+        # Better error handling for API timeouts and limits
+        if "Gemini API Error" in error_msg:
+            return jsonify({"error": "AI Service unavailable or rate limited.", "details": error_msg}), 502
+        return jsonify({"error": error_msg, "trace": traceback.format_exc()[-600:]}), 500
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "service": "GoLegal Audit v3 - Gemini 2.5 Flash",
-        "gemini_key_set": bool(GEMINI_API_KEY),
-        "key_preview": GEMINI_API_KEY[:8]+"..." if GEMINI_API_KEY else "NOT SET"
-    })
+    return jsonify({"status": "ok", "service": "GoLegal Audit v5 - Parallel", "gemini_key_set": bool(GEMINI_API_KEY)})
 
 @app.route("/test-gemini")
 def test_gemini():
     try:
-        if not GEMINI_API_KEY:
-            return jsonify({"error": "GEMINI_API_KEY not set"}), 500
-        result = call_gemini('Say hello in JSON: {"message": "hello"}')
-        return jsonify({"success": True, "response": result})
+        result = call_gemini('Reply with only this JSON: {"message": "hello"}')
+        return jsonify({"success": True, "response": json.loads(result)})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e), "trace": traceback.format_exc()[-500:]})
+        return jsonify({"success": False, "error": str(e)})
 
-@app.route("/list-models")
-def list_models():
-    try:
-        resp = requests.get(
-            f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}",
-            timeout=10
-        )
-        data = resp.json()
-        models = [m["name"] for m in data.get("models",[])
-                  if "generateContent" in m.get("supportedGenerationMethods",[])]
-        return jsonify({"models": models})
-    except Exception as e:
-        return jsonify({"error": str(e)})
 @app.route("/debug-audit")
 def debug_audit():
     try:
         url = request.args.get("url", "https://thegolegal.com")
-        if not GEMINI_API_KEY:
-            return jsonify({"error": "GEMINI_API_KEY not set"}), 500
         soup, homepage_text, err = fetch_page(url)
-        if err:
-            return jsonify({"step": "fetch_page", "error": err})
+        if err: return jsonify({"error": err})
         links = find_links(soup, url)
-        pages_content = {"homepage": homepage_text}
-        for kw, link_url in list(links.items())[:3]:
-            _, text, e = fetch_page(link_url)
-            if not e and text:
-                pages_content[link_url] = text[:1000]
-        evidence = f"WEBSITE: {url}\n"
-        for page_url, text in pages_content.items():
-            evidence += f"\n=== {page_url} ===\n{text[:500]}\n"
-        prompt = f"Analyze this website for legal compliance and return JSON with a 'test' key set to 'working':\n{evidence[:2000]}"
-        raw = call_gemini(prompt)
-        return jsonify({
-            "step": "complete",
-            "links_found": links,
-            "pages_crawled": len(pages_content),
-            "gemini_raw_response": raw[:500]
-        })
+        return jsonify({"step": "complete", "links_found": links, "homepage_chars": len(homepage_text)})
     except Exception as e:
-        return jsonify({
-            "step": "error",
-            "error": str(e),
-            "trace": traceback.format_exc()[-600:]
-        })
+        return jsonify({"error": str(e)})
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, port=port, host="0.0.0.0")

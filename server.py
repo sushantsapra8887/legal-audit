@@ -48,11 +48,10 @@ def call_gemini(prompt):
         headers={"Content-Type": "application/json"},
         json={
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 2000,
-                "responseMimeType": "application/json"
-            }
+           "generationConfig": {
+    "temperature": 0.1,
+    "maxOutputTokens": 3000
+}
         },
         timeout=60
     )

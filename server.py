@@ -163,7 +163,19 @@ def test_gemini():
         return jsonify({"success": True, "response": result})
     except Exception as e:
         return jsonify({"success": False, "error": str(e), "trace": traceback.format_exc()[-500:]})
-
+@app.route("/list-models")
+def list_models():
+    try:
+        resp = requests.get(
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}",
+            timeout=10
+        )
+        data = resp.json()
+        models = [m["name"] for m in data.get("models",[]) 
+                  if "generateContent" in m.get("supportedGenerationMethods",[])]
+        return jsonify({"models": models})
+    except Exception as e:
+        return jsonify({"error": str(e)})
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, port=port, host="0.0.0.0")

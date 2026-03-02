@@ -212,7 +212,38 @@ def list_models():
         return jsonify({"models": models})
     except Exception as e:
         return jsonify({"error": str(e)})
-
+@app.route("/debug-audit")
+def debug_audit():
+    try:
+        url = request.args.get("url", "https://thegolegal.com")
+        if not GEMINI_API_KEY:
+            return jsonify({"error": "GEMINI_API_KEY not set"}), 500
+        soup, homepage_text, err = fetch_page(url)
+        if err:
+            return jsonify({"step": "fetch_page", "error": err})
+        links = find_links(soup, url)
+        pages_content = {"homepage": homepage_text}
+        for kw, link_url in list(links.items())[:3]:
+            _, text, e = fetch_page(link_url)
+            if not e and text:
+                pages_content[link_url] = text[:1000]
+        evidence = f"WEBSITE: {url}\n"
+        for page_url, text in pages_content.items():
+            evidence += f"\n=== {page_url} ===\n{text[:500]}\n"
+        prompt = f"Analyze this website for legal compliance and return JSON with a 'test' key set to 'working':\n{evidence[:2000]}"
+        raw = call_gemini(prompt)
+        return jsonify({
+            "step": "complete",
+            "links_found": links,
+            "pages_crawled": len(pages_content),
+            "gemini_raw_response": raw[:500]
+        })
+    except Exception as e:
+        return jsonify({
+            "step": "error",
+            "error": str(e),
+            "trace": traceback.format_exc()[-600:]
+        })
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, port=port, host="0.0.0.0")

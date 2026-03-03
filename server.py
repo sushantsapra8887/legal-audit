@@ -227,7 +227,7 @@ Return ONLY this JSON (keep descriptions under 10 words each):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(debug=False, port=port, host="0.0.0.0")            if urlparse(full).netloc != base_domain: continue
+    app.run(debug=False, port=port, host="0.0.0.0")          
             anchor = a.get_text(strip=True).lower()
             for kw in keywords:
                 if kw in full.lower() or kw in anchor:

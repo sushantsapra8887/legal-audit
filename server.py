@@ -51,7 +51,7 @@ def call_gemini(prompt):
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.0,
-                "maxOutputTokens": 800,
+                "maxOutputTokens": 2048,
                 "responseMimeType": "application/json" # Forces Gemini to return strict JSON
             }
         },

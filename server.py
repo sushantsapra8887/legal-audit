@@ -22,7 +22,7 @@ def fetch_page(url):
         soup = BeautifulSoup(r.text, "html.parser")
         for t in soup(["script","style","noscript"]): t.decompose()
         # Only take first 1500 chars — enough to detect policies
-        return soup, soup.get_text(separator=" ", strip=True)[:1500], None
+        return soup, soup.get_text(separator=" ", strip=True)[:3000], None
     except Exception as e:
         return None, "", str(e)
 
@@ -52,10 +52,9 @@ def call_gemini(prompt):
             "generationConfig": {
                 "temperature": 0.0,
                 "maxOutputTokens": 4096,
-                "responseMimeType": "application/json" # Forces Gemini to return strict JSON
             }
         },
-        timeout=25
+        timeout=55
     )
     if resp.status_code != 200:
         raise Exception(f"Gemini API Error {resp.status_code}: {resp.text[:200]}")
@@ -85,7 +84,7 @@ def audit():
 
         # Step 3: Fetch policy pages IN PARALLEL (Massive Speed Boost)
         pages = {"Homepage": homepage_text}
-        links_to_fetch = list(links.items())[:5]
+        links_to_fetch = list(links.items())[:8]
         
         def fetch_policy_task(item):
             kw, link_url = item
@@ -104,7 +103,7 @@ def audit():
         ssl = "YES" if url.startswith("https") else "NO"
         evidence_lines = [f"URL: {url} | SSL: {ssl}"]
         for name, text in pages.items():
-            evidence_lines.append(f"[{name}]: {text[:400]}")
+            evidence_lines.append(f"[{name}]: {text[:800]}")
         evidence = "\n".join(evidence_lines)
 
         # Step 5: SHORT focused prompt

@@ -51,7 +51,7 @@ def call_gemini(prompt):
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.0,
-                "maxOutputTokens": 2048,
+                "maxOutputTokens": 4096,
                 "responseMimeType": "application/json" # Forces Gemini to return strict JSON
             }
         },
@@ -191,12 +191,12 @@ def debug_full():
             evidence_lines.append(f"[{name}]: {text[:400]}")
         evidence = "\n".join(evidence_lines)
 
-        prompt = f"""Indian legal compliance audit. Analyze this website and return ONLY a JSON object starting with {{ and ending with }}.
+        prompt = f"""You are a legal compliance expert. Analyze this website and return a short JSON report.
 
 {evidence}
 
-Return this JSON with your findings:
-{{"score":75,"checks":{{"ssl":{{"status":"pass","title":"SSL","description":"finding","found_at":null}},"privacy_policy":{{"status":"pass","title":"Privacy Policy","description":"finding","found_at":null}},"terms_of_service":{{"status":"fail","title":"Terms","description":"finding","found_at":null}},"cookie_policy":{{"status":"fail","title":"Cookie","description":"finding","found_at":null}},"refund_policy":{{"status":"fail","title":"Refund","description":"finding","found_at":null}},"dpdp_compliance":{{"status":"warn","title":"DPDP","description":"finding","found_at":null}},"grievance_officer":{{"status":"fail","title":"Grievance","description":"finding","found_at":null}},"contact_info":{{"status":"pass","title":"Contact","description":"finding","found_at":null}},"disclaimer":{{"status":"fail","title":"Disclaimer","description":"finding","found_at":null}},"copyright":{{"status":"pass","title":"Copyright","description":"finding","found_at":null}}}},"ai_summary":"summary here","top_risks":["risk1","risk2","risk3"]}}"""
+Return ONLY this JSON (keep descriptions under 10 words each):
+{{"score":0,"checks":{{"ssl":{{"status":"pass","title":"SSL","description":"brief finding","found_at":null}},"privacy_policy":{{"status":"fail","title":"Privacy Policy","description":"brief finding","found_at":null}},"terms_of_service":{{"status":"fail","title":"Terms","description":"brief finding","found_at":null}},"cookie_policy":{{"status":"fail","title":"Cookie Policy","description":"brief finding","found_at":null}},"refund_policy":{{"status":"fail","title":"Refund Policy","description":"brief finding","found_at":null}},"dpdp_compliance":{{"status":"fail","title":"DPDP Act","description":"brief finding","found_at":null}},"grievance_officer":{{"status":"fail","title":"Grievance Officer","description":"brief finding","found_at":null}},"contact_info":{{"status":"fail","title":"Contact Info","description":"brief finding","found_at":null}},"disclaimer":{{"status":"fail","title":"Disclaimer","description":"brief finding","found_at":null}},"copyright":{{"status":"fail","title":"Copyright","description":"brief finding","found_at":null}}}},"ai_summary":"one sentence summary","top_risks":["risk1","risk2","risk3"]}}"""
 
         raw = call_gemini(prompt)
         

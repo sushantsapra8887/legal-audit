@@ -171,7 +171,45 @@ def debug_audit():
         return jsonify({"step": "complete", "links_found": links, "homepage_chars": len(homepage_text)})
     except Exception as e:
         return jsonify({"error": str(e)})
+@app.route("/debug-full")
+def debug_full():
+    try:
+        url = request.args.get("url", "https://thegolegal.com")
+        soup, homepage_text, err = fetch_page(url)
+        if err: return jsonify({"step": "fetch_failed", "error": err})
+        
+        links = find_links(soup, url)
+        pages = {"Homepage": homepage_text}
+        for kw, link_url in list(links.items())[:3]:
+            _, text, e = fetch_page(link_url)
+            if not e and text:
+                pages[kw] = text
 
+        ssl = "YES" if url.startswith("https") else "NO"
+        evidence_lines = [f"URL: {url} | SSL: {ssl}"]
+        for name, text in pages.items():
+            evidence_lines.append(f"[{name}]: {text[:400]}")
+        evidence = "\n".join(evidence_lines)
+
+        prompt = f"""Indian legal compliance audit. Analyze this website and return ONLY a JSON object starting with {{ and ending with }}.
+
+{evidence}
+
+Return this JSON with your findings:
+{{"score":75,"checks":{{"ssl":{{"status":"pass","title":"SSL","description":"finding","found_at":null}},"privacy_policy":{{"status":"pass","title":"Privacy Policy","description":"finding","found_at":null}},"terms_of_service":{{"status":"fail","title":"Terms","description":"finding","found_at":null}},"cookie_policy":{{"status":"fail","title":"Cookie","description":"finding","found_at":null}},"refund_policy":{{"status":"fail","title":"Refund","description":"finding","found_at":null}},"dpdp_compliance":{{"status":"warn","title":"DPDP","description":"finding","found_at":null}},"grievance_officer":{{"status":"fail","title":"Grievance","description":"finding","found_at":null}},"contact_info":{{"status":"pass","title":"Contact","description":"finding","found_at":null}},"disclaimer":{{"status":"fail","title":"Disclaimer","description":"finding","found_at":null}},"copyright":{{"status":"pass","title":"Copyright","description":"finding","found_at":null}}}},"ai_summary":"summary here","top_risks":["risk1","risk2","risk3"]}}"""
+
+        raw = call_gemini(prompt)
+        
+        # Try parse
+        try:
+            result = json.loads(raw)
+            return jsonify({"step": "success", "result": result})
+        except Exception as pe:
+            return jsonify({"step": "json_parse_failed", "parse_error": str(pe), "raw_response": raw[:500]})
+
+    except Exception as e:
+        import traceback
+        return jsonify({"step": "exception", "error": str(e), "trace": traceback.format_exc()[-600:]})
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, port=port, host="0.0.0.0")
